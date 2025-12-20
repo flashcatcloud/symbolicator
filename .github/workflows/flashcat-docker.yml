@@ -3,8 +3,7 @@ name: Build and Push to FlashCat Registry
 on:
   push:
     branches:
-      - master
-      - release/**
+      - flashcat
     tags:
       - '*'
   workflow_dispatch:
