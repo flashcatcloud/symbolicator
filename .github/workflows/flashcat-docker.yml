@@ -1,0 +1,146 @@
+name: Build and Push to FlashCat Registry
+
+on:
+  push:
+    branches:
+      - flashcat
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Push images after successful builds'
+        required: true
+        default: true
+        type: boolean
+      tag:
+        description: 'Custom image tag (optional, defaults to git sha or tag)'
+        required: false
+        type: string
+
+concurrency:
+  group: flashcat-docker-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY_FLASHDUTY: registry.flashcat.cloud/flashduty
+  REGISTRY_FLASHDUTY_HOSTED: registry.flashcat.cloud/flashduty-hosted
+  IMAGE_NAME: symbolicator
+
+jobs:
+  build-binaries:
+    name: Build Binary (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm curl
+
+      - name: Install Rust Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target "${{ matrix.rust_target }}" --no-self-update
+
+      - uses: swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref_name, 'release/') }}
+        with:
+          key: flashcat-${{ github.job }}
+          save-if: ${{ github.ref_name == 'master' }}
+
+      - name: Build Binary
+        run: |
+          cargo build --release --locked --target="${{ matrix.rust_target }}" --features="symbolicator-crash"
+          mv "target/${{ matrix.rust_target }}/release/symbolicator" ./symbolicator
+          ./symbolicator --version
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashcat-symbolicator-${{ matrix.arch }}
+          path: ./symbolicator
+
+  build-and-push:
+    name: Build and Push Docker Image
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
+    needs: build-binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: flashcat-symbolicator-amd64
+          path: /tmp/docker-ctx/symbolicator-binary-amd64
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: flashcat-symbolicator-arm64
+          path: /tmp/docker-ctx/symbolicator-binary-arm64
+
+      - name: Prepare Docker Context
+        run: |
+          cp Dockerfile /tmp/docker-ctx
+          mkdir -p /tmp/docker-ctx/binaries/linux/amd64 /tmp/docker-ctx/binaries/linux/arm64
+          mv /tmp/docker-ctx/symbolicator-binary-amd64/symbolicator /tmp/docker-ctx/binaries/linux/amd64
+          mv /tmp/docker-ctx/symbolicator-binary-arm64/symbolicator /tmp/docker-ctx/binaries/linux/arm64
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to FlashCat Registry (flashduty)
+        uses: docker/login-action@v3
+        with:
+          registry: registry.flashcat.cloud
+          username: ${{ secrets.FLASHCAT_REGISTRY_USERNAME }}
+          password: ${{ secrets.FLASHCAT_REGISTRY_PASSWORD }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_FLASHDUTY }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY_FLASHDUTY_HOSTED }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Custom tag from workflow_dispatch
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            # Git SHA
+            type=sha,prefix=
+            # Branch name (e.g., master)
+            type=ref,event=branch
+            # Git tag (e.g., v1.0.0)
+            type=ref,event=tag
+            # Latest for master branch
+            type=raw,value=latest,enable=${{ github.ref_name == 'master' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: /tmp/docker-ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
